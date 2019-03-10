@@ -1,0 +1,341 @@
+(* These Specificaton of MQTT protocol are written by Sabina. *)
+
+(*   Header  *)
+algorithm MQTTSpecs
+extends Sequences, Naturals, TLC, FiniteSets
+
+(*  Declaration Section  *)
+
+variable  
+
+    network = [p \in Broker \cup Publisher \cup Subscriber |-> <<>>],
+	activeClients = {},
+	Topics = {"A", "B", "C"},
+	TopicPool = [t \in Topics |-> {}]
+
+(*	TopicPool = [t \in Topics |-> CASE (t = "A") -> {3,4}] *)
+
+
+
+
+definition send(ch, msg) ==
+  [network EXCEPT ![ch] = Append(@, msg)]
+
+procedure respondPUBREL(pkt)
+	begin
+		if ({pkt.sender} \cap activeClients) # {} then
+			network := send(pkt.sender, [type |-> "PUBCOMP", sender |-> self]);							
+		end if;
+	end procedure
+
+procedure respondPUBREC(pkt)
+	begin
+		if  ({pkt.sender} \cap activeClients) # {} then
+			network := send(pkt.sender, [type |-> "PUBREL", sender |-> self]);							
+		end if;
+	end procedure
+
+procedure respondPINGREQ(pkt)
+	begin
+		if ({pkt.sender} \cap activeClients) # {} then
+			network := send(pkt.sender, [type |-> "PINGRESP", sender |-> self]);							
+		end if;
+	end procedure
+
+procedure commenceQoS2(to)
+variable PUBSUCC = FALSE
+begin
+(*	print "Commencing ..... ";*)
+cqos2:
+	loop
+		network := send(to, [type |-> "PUBLISH", sender |-> self, topic |-> "A", QoS |-> 2]);
+		
+waitPUB2:	
+		when Len(network[self]) > 0;
+		
+		with packet = Head(network[self])		(* handle message at the head of the message queue *)
+			if packet.type = "PUBREC" then
+				network := send(to, [type |-> "PUBREL", sender |-> self, topic |-> "A", QoS |-> 2]);
+			end if;
+			network[self] := Tail(network[self]);
+		end with;
+		
+waitPUBCOMP2:		
+		when Len(network[self]) > 0;
+		
+		with pkt = Head(network[self])		(* handle message at the head of the message queue *)
+			if pkt.type = "PUBCOMP" then
+				PUBSUCC := TRUE;
+			end if;
+			network[self] := Tail(network[self]);
+		end with;
+		
+		(* Break the loop if publish has been successfully completed *)
+		if PUBSUCC = TRUE then 
+			break;
+		end if;
+	end loop;
+
+end procedure
+		
+procedure respondQoS2(pkt)
+variable PUBSUCC = FALSE
+begin
+rqos2:
+	loop
+		network := send(pkt.sender, [type |-> "PUBREC", sender |-> self]);
+		
+waitPUBREL:	
+		when Len(network[self]) > 0;
+		
+		with packet = Head(network[self])		(* handle message at the head of the message queue *)
+			if packet.type = "PUBREL" then
+				network := send(pkt.sender, [type |-> "PUBCOMP", sender |-> self]);
+				PUBSUCC := TRUE;
+			end if;
+		network[self] := Tail(network[self]);
+		end with;
+		
+		
+		(* Break the loop if publish has been successfully completed *)
+		if PUBSUCC = TRUE then 
+			break;
+		end if;
+	end loop;
+	
+end procedure
+
+
+
+	
+		
+process Broker[1]
+		variable
+			rules = 0, status = 0, statusRecord = 0,
+			wait_REL = {}
+
+		procedure publish(pkt)
+		begin
+l1:			branch
+				pkt.QoS = 0 then
+					if TopicPool[pkt.topic] # {} then
+					for sub \in TopicPool[pkt.topic]
+						network := send(sub, [type |-> "PUBLISH", sender |-> self, QoS |->0]);
+					end for;
+					end if;
+			or
+				pkt.QoS = 1 then
+					for sub \in TopicPool[pkt.topic]
+						network := send(sub, [type |-> "PUBLISH", sender |-> self, QoS |->1]);
+					end for;
+					network := send(pkt.sender, [type |-> "PUBACK", sender |-> self]);
+			or
+				pkt.QoS = 2 then
+					network := send(pkt.sender, [type |-> "PUBREC", sender |-> self]);
+					wait_REL := wait_REL \cup {pkt.sender};
+			end branch;
+		end procedure
+			
+		begin
+		
+listen:
+			loop
+				if Len(network[self]) > 0 then
+									    
+				    with packet = Head(network[self])		(* handle message at the head of the message queue *)
+						branch
+							packet.type = "CONNECT" then
+								activeClients := activeClients \cup {packet.sender};
+								network := send(packet.sender, [type |-> "CONNACK", sender |-> self]);	
+								network[self] := Tail(network[self]);
+						or
+							packet.type = "PUBLISH" then
+								network[self] := Tail(network[self]);
+								publish(packet);				
+						or
+							packet.type = "PUBACK" then
+							(* Receives ACK for QoS 1 *)
+								network[self] := Tail(network[self]);
+						or
+							packet.type = "PUBREL" then
+								if ({packet.sender} \cap wait_REL) # {} then
+									wait_REL := wait_REL \ {packet.sender};
+									network := send(packet.sender, [type |-> "PUBCOMP", sender |-> self]);	
+								end if;
+								network[self] := Tail(network[self]);
+						or
+							packet.type = "SUBSCRIBE" then
+								if ({packet.sender} \cap activeClients) # {} then
+									TopicPool[packet.topic] := TopicPool[packet.topic] \cup {packet.sender};
+									network := send(packet.sender, [type |-> "SUBACK", sender |-> self]);	
+								end if;
+								network[self] := Tail(network[self]);
+						or
+							packet.type = "UNSUBSCRIBE" then
+								if ({packet.sender} \cap activeClients) # {}  then
+									TopicPool[packet.topic] := TopicPool[packet.topic] \ {packet.sender};
+								end if;
+								network[self] := Tail(network[self]);
+						
+							(* Receives from subscriber, must send PUBREL to subscriber and receive PUBCOMP *)
+						or
+							packet.type = "PINGREQ" then
+								respondPINGREQ(packet);
+								network[self] := Tail(network[self]);
+						or
+							packet.type = "DISCONNECT" then
+								activeClients := activeClients \ {packet.sender};
+								network[self] := Tail(network[self]);
+						end branch;
+						
+			        end with;
+				   
+				   end if;
+			end loop;
+			
+			
+		end process
+
+process Publisher[1]
+	variable
+		CONNSUCC = FALSE, PUBSUCC = FALSE, BrokerID = 1
+	begin
+PubStart:	
+	(* BrokerID := BrokerID \in Broker; *)
+	loop
+		network := send(BrokerID, [type |-> "CONNECT", sender |-> self]);
+		
+waitCONN:
+		when Len(network[self]) > 0;
+
+		with packet = Head(network[self])		(* handle message at the head of the message queue *)
+			if packet.type = "CONNACK" then
+				CONNSUCC := TRUE;
+			end if;
+			network[self] := Tail(network[self]);
+		end with;
+		
+		(* Break the loop if the connection has been successfully made *)
+		if CONNSUCC = TRUE then 
+			break;
+		end if;
+	end loop;
+	
+	
+tryPUBLISH:
+	branch
+	
+	TRUE then
+	(* Publish with QoS = 0 *)
+lbl:	network := send(BrokerID, [type |-> "PUBLISH", sender |-> self, topic |-> "A", QoS |-> 0]);
+	
+
+or
+	TRUE then
+	(* Publish with QoS = 1 *)
+
+tryPUB1:
+	
+	loop
+		network := send(BrokerID, [type |-> "PUBLISH", sender |-> self, topic |-> "A", QoS |-> 1]);
+waitPUB1:
+		when Len(network[self]) > 0;
+		
+		with packet = Head(network[self])		(* handle message at the head of the message queue *)
+			if packet.type = "PUBACK" then
+				PUBSUCC := TRUE;
+			end if;
+			network[self] := Tail(network[self]);
+		end with;
+		
+		(* Break the loop if publish has been successfully completed *)
+		if PUBSUCC = TRUE then 
+			break;
+		end if;
+	end loop;
+
+or 
+	TRUE then
+	(* Publish with QoS = 2 *)
+tryPUB2:
+	commenceQoS2(BrokerID);
+
+end branch;
+	
+	end process
+
+
+
+
+fair	process Subscriber[2]
+	variable
+		rules = 0, BrokerID = 1, SUBSUCC = FALSE, CONNSUCC = FALSE, PUBRECE = FALSE
+	begin
+	
+Sub_start:	
+	(* BrokerID := BrokerID \in Broker; *)
+	loop
+		network := send(BrokerID, [type |-> "CONNECT", sender |-> self]);
+		
+Sub_waitCONN:
+		when Len(network[self]) > 0;
+
+		with packet = Head(network[self])		(* handle message at the head of the message queue *)
+			if packet.type = "CONNACK" then
+				CONNSUCC := TRUE;
+			end if;
+			network[self] := Tail(network[self]);
+		end with;
+		
+		(* Break the loop if the connection has been successfully made *)
+		if CONNSUCC = TRUE then 
+			break;
+		end if;
+	end loop;
+
+	
+Sub_subscription:
+	loop
+		network := send(BrokerID, [type |-> "SUBSCRIBE", topic |-> "A", sender |-> self]);
+
+Sub_waitsubscription:
+		when Len(network[self]) > 0;
+
+		with packet = Head(network[self])		(* handle message at the head of the message queue *)
+			if packet.type = "SUBACK" then
+				SUBSUCC := TRUE;
+			end if;
+			network[self] := Tail(network[self]);
+		end with;
+		(* Break the loop if the subscription has been successfully made *)
+		if SUBSUCC = TRUE then 
+			break;
+		end if;
+	end loop;
+
+Sub_listen:
+			loop
+				if Len(network[self]) > 0 then
+									    
+				    with packet = Head(network[self])		(* handle message at the head of the message queue *)
+						branch
+							packet.type = "PUBLISH" then
+								network := send(packet.sender, [type |-> "PUBACK", sender |-> self]);
+								PUBRECE := TRUE;
+						end branch;
+						
+						network[self] := Tail(network[self]);
+			        end with;
+				   
+				end if;
+			end loop;
+	end process
+	
+
+end algorithm
+(*
+temporal \A p \in Publisher, s \in Subscriber : <>( p.PUBSUCC = TRUE => s.PUBRECE = TRUE)
+
+*)
+
+
